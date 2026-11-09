@@ -1,0 +1,294 @@
+# Copyright 2025 HuggingFace Inc. and the LlamaFactory team.
+#
+# This code is inspired by the HuggingFace's transformers library.
+# https://github.com/huggingface/transformers/blob/v4.40.0/examples/pytorch/summarization/run_summarization.py
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import gc
+import ctypes
+import os
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
+from ...extras.constants import IGNORE_INDEX
+from ...extras.logging import get_logger
+from ...extras.misc import calculate_tps
+from ...extras.packages import is_transformers_version_greater_than
+from ...extras.ploting import plot_loss
+from ...model import load_model, load_tokenizer
+from ..trainer_utils import create_modelcard_and_push, create_ref_model
+from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
+from .trainer import CustomSeq2SeqTrainer
+
+
+if TYPE_CHECKING:
+    from transformers import Seq2SeqTrainingArguments, TrainerCallback
+
+    from ...hparams import DataArguments, FinetuningArguments, GeneratingArguments, ModelArguments
+
+
+logger = get_logger(__name__)
+
+
+def _write_adapter_save_diagnostic(output_dir: str, stage: str) -> None:
+    """Persist per-rank memory state so SIGKILLs remain diagnosable."""
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    lines = [f"stage={stage}", f"rank={rank}"]
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmHWM:", "VmSize:", "RssAnon:", "RssFile:")):
+                    lines.append(line.strip())
+    except OSError as exc:
+        lines.append(f"proc_status_error={exc!r}")
+
+    for name in ("memory.current", "memory.max", "memory.events"):
+        path = f"/sys/fs/cgroup/{name}"
+        try:
+            with open(path) as f:
+                value = f.read().strip().replace("\n", ";")
+            lines.append(f"cgroup_{name}={value}")
+        except OSError as exc:
+            lines.append(f"cgroup_{name}_error={exc!r}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"adapter_save_diag_rank{rank}.log")
+    with open(path, "a") as f:
+        f.write(" | ".join(lines) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def run_sft(
+    model_args: "ModelArguments",
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+    finetuning_args: "FinetuningArguments",
+    generating_args: "GeneratingArguments",
+    callbacks: Optional[list["TrainerCallback"]] = None,
+):
+    tokenizer_module = load_tokenizer(model_args)
+    tokenizer = tokenizer_module["tokenizer"]
+    template = get_template_and_fix_tokenizer(tokenizer, data_args)
+    dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
+    model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+
+    ref_model = None
+    if finetuning_args.use_asft_loss:
+        ref_model = create_ref_model(model_args, finetuning_args)
+
+    if getattr(model, "is_quantized", False) and not training_args.do_train:
+        setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
+
+    data_collator = SFTDataCollatorWith4DAttentionMask(
+        template=template,
+        model=model if not training_args.predict_with_generate else None,
+        pad_to_multiple_of=8 if training_args.do_train else None,  # for shift short attention
+        label_pad_token_id=IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
+        block_diag_attn=model_args.block_diag_attn,
+        neat_packing=data_args.neat_packing,
+        attn_implementation=getattr(model.config, "_attn_implementation", None),
+        compute_dtype=model_args.compute_dtype,
+        **tokenizer_module,
+    )
+
+    # Metric utils
+    metric_module = {}
+    if model_args.use_kt:
+        if training_args.predict_with_generate:
+            raise NotImplementedError("`predict_with_generate` is not supported in KTransformers SFT yet.")
+        elif finetuning_args.compute_accuracy:
+            raise NotImplementedError("`compute_accuracy` is not supported in KTransformers SFT yet.")
+
+    if training_args.predict_with_generate:
+        metric_module["compute_metrics"] = ComputeSimilarity(tokenizer=tokenizer)
+    elif finetuning_args.compute_accuracy:
+        metric_module["compute_metrics"] = ComputeAccuracy()
+        metric_module["preprocess_logits_for_metrics"] = eval_logit_processor
+
+    # Keyword arguments for `model.generate`
+    gen_kwargs = generating_args.to_dict(obey_generation_config=True)
+
+    # Compatible with Transformers v4 and Transformers v5
+    if is_transformers_version_greater_than("4.58.0"):
+        extra_ids = getattr(tokenizer, "additional_special_tokens_ids", None)
+        if not isinstance(extra_ids, list):
+            extra_special_tokens = getattr(tokenizer, "_extra_special_tokens", [])
+            string_tokens = [str(t) for t in extra_special_tokens]
+            extra_ids = tokenizer.convert_tokens_to_ids(string_tokens)
+        all_eos_ids = [tokenizer.eos_token_id] + [i for i in extra_ids if i != -1]
+        unique_eos_ids = list(dict.fromkeys(all_eos_ids))
+        gen_kwargs["eos_token_id"] = unique_eos_ids
+    else:
+        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
+    gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+
+    # Initialize our Trainer
+    if model_args.use_kt:
+        from ktransformers.sft.lora import KTrainer  # type: ignore
+        from ktransformers.util.globals import GLOBAL_CONFIG  # type: ignore
+
+        GLOBAL_CONFIG._config["mod"] = "sft"
+
+        trainer = KTrainer(
+            model=model,
+            args=training_args,
+            tokenizer=tokenizer_module,
+            data_collator=data_collator,
+            callbacks=callbacks,
+            **dataset_module,
+            **metric_module,
+        )
+        trainer.model_accepts_loss_kwargs = False
+        model.config.use_cache = False
+
+    else:
+        trainer = CustomSeq2SeqTrainer(
+            model=model,
+            args=training_args,
+            finetuning_args=finetuning_args,
+            data_collator=data_collator,
+            callbacks=callbacks,
+            gen_kwargs=gen_kwargs,
+            ref_model=ref_model,
+            **dataset_module,
+            **tokenizer_module,
+            **metric_module,
+        )
+
+    # MoE-LoRA: 注册中间 checkpoint 保存 + 监控指标 callback
+    if finetuning_args.finetuning_type == "moe_lora":
+        from ...model.model_utils.moe_lora import (
+            MoELoRABalanceDecayCallback,
+            MoELoRALightSaveCallback,
+            MoELoRASaveCallback,
+            MoELoRAStatsCallback,
+        )
+
+        trainer.add_callback(MoELoRASaveCallback(finetuning_args))
+        trainer.add_callback(MoELoRABalanceDecayCallback())
+        light_save_steps = int(os.environ.get("MOE_LORA_LIGHT_SAVE_STEPS", "0"))
+        if light_save_steps > 0:
+            trainer.add_callback(MoELoRALightSaveCallback(finetuning_args, light_save_steps))
+        # Stats callback 必须插在 WandbCallback 等默认 logger callback 之前，否则
+        # W_fro_norm / dead_experts / p_L_entropy 这些指标会在 wandb 转发完 logs
+        # 之后才被写入 logs 字典，导致曲线缺失（但 train summary 仍能看到，因为它
+        # 读的是 state.log_history 最后一条已经写全的记录）。
+        if os.environ.get("MOE_LORA_DISABLE_STATS", "0") != "1":
+            trainer.callback_handler.callbacks.insert(0, MoELoRAStatsCallback())
+
+    # MoLA: 复用 moe_lora 的 stats callback(模块结构相同),自家 save callback
+    if finetuning_args.finetuning_type == "mola":
+        from ...model.model_utils.mola import MoLASaveCallback
+        from ...model.model_utils.moe_lora import MoELoRAStatsCallback
+
+        trainer.add_callback(MoLASaveCallback(finetuning_args))
+        if os.environ.get("MOE_LORA_DISABLE_STATS", "0") != "1":
+            trainer.callback_handler.callbacks.insert(0, MoELoRAStatsCallback())
+
+    # DAS-LoRA: 自家 save callback(stats callback 不复用,因为模块结构不同)
+    if finetuning_args.finetuning_type == "das_lora":
+        from ...model.model_utils.das_lora import DASLoRASaveCallback
+
+        trainer.add_callback(DASLoRASaveCallback(finetuning_args))
+
+    # Training
+    if training_args.do_train:
+        train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        if finetuning_args.finetuning_type == "moe_lora":
+            # MoE-LoRA: 只保存 trainable LoRA params + 配置，跳过基座模型
+            from ...model.model_utils.moe_lora import save_moe_lora_state
+
+            _write_adapter_save_diagnostic(training_args.output_dir, "before_release")
+            logger.info_rank0("Training finished; releasing optimizer state before adapter save.")
+
+            # 训练已经结束且 save_only_model=true，不再需要 optimizer/scheduler/grad。
+            # ZeRO-2 的 optimizer state 会显著压缩容器 CPU 内存余量，先释放再保存 adapter。
+            for param in trainer.model.parameters():
+                param.grad = None
+            deepspeed_engine = getattr(trainer, "deepspeed", None)
+            if deepspeed_engine is None:
+                wrapped = getattr(trainer, "model_wrapped", None)
+                if hasattr(wrapped, "optimizer"):
+                    deepspeed_engine = wrapped
+            if deepspeed_engine is not None and hasattr(deepspeed_engine, "optimizer"):
+                deepspeed_engine.optimizer = None
+            trainer.optimizer = None
+            trainer.lr_scheduler = None
+            gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _write_adapter_save_diagnostic(training_args.output_dir, "after_release")
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            logger.info_rank0("Released optimizer and gradient state before saving MoE-LoRA adapter.")
+
+            _write_adapter_save_diagnostic(training_args.output_dir, "before_adapter_save")
+            save_moe_lora_state(trainer.model, training_args.output_dir, finetuning_args)
+            _write_adapter_save_diagnostic(training_args.output_dir, "after_adapter_save")
+        elif finetuning_args.finetuning_type == "mola":
+            # MoLA: 保存 trainable params + 配置(用 mola_state.safetensors / mola_config.json)
+            from ...model.model_utils.mola import save_mola_state
+
+            save_mola_state(trainer.model, training_args.output_dir, finetuning_args)
+        elif finetuning_args.finetuning_type == "das_lora":
+            from ...model.model_utils.das_lora import save_das_lora_state
+
+            save_das_lora_state(trainer.model, training_args.output_dir, finetuning_args)
+        else:
+            trainer.save_model()
+        if finetuning_args.include_effective_tokens_per_second:
+            train_result.metrics["effective_tokens_per_sec"] = calculate_tps(
+                dataset_module["train_dataset"], train_result.metrics, stage="sft"
+            )
+
+        trainer.log_metrics("train", train_result.metrics)
+        trainer.save_metrics("train", train_result.metrics)
+        trainer.save_state()
+        if trainer.is_world_process_zero() and finetuning_args.plot_loss:
+            keys = ["loss"]
+            if isinstance(dataset_module.get("eval_dataset"), dict):
+                keys += sum(
+                    [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []
+                )
+            else:
+                keys += ["eval_loss", "eval_accuracy"]
+
+            plot_loss(training_args.output_dir, keys=keys)
+
+    if training_args.predict_with_generate:
+        tokenizer.padding_side = "left"  # use left-padding in generation
+
+    # Evaluation
+    if training_args.do_eval:
+        metrics = trainer.evaluate(metric_key_prefix="eval", **gen_kwargs)
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
+    # Predict
+    if training_args.do_predict:
+        logger.warning_rank0_once("Batch generation can be very slow. Consider using `scripts/vllm_infer.py` instead.")
+        predict_results = trainer.predict(dataset_module["eval_dataset"], metric_key_prefix="predict", **gen_kwargs)
+        trainer.log_metrics("predict", predict_results.metrics)
+        trainer.save_metrics("predict", predict_results.metrics)
+        trainer.save_predictions(dataset_module["eval_dataset"], predict_results, generating_args.skip_special_tokens)
+
+    # Create model card
+    create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)

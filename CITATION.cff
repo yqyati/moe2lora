@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "Please cite our paper if you use MoE2-LoRA."
+title: "MoE²-LoRA: When MoE Models meet MoE-style Low-Rank Adaptation"
+type: software
+authors:
+  - family-names: Yang
+    given-names: Qingyu
+  - family-names: He
+    given-names: Haonan
+  - family-names: Li
+    given-names: Minglei
+  - family-names: Ye
+    given-names: Jingqi
+  - family-names: Chen
+    given-names: Tao
+  - family-names: Bai
+    given-names: Lei
+  - family-names: Ye
+    given-names: Peng
+repository-code: "https://github.com/yqyati/moe-2lora"
+url: "https://openreview.net/forum?id=lTb6mATNkF"
+license: Apache-2.0
